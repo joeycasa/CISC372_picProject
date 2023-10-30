@@ -3,6 +3,7 @@
 #include <time.h>
 #include <string.h>
 #include "image.h"
+#include <pthread.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -10,7 +11,15 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
-//An array of kernel matrices to be used for image convolution.  
+typedef struct {
+    int start;
+    int end;
+    Image* srcImage;
+    Image* destImage;
+    Matrix algorithm;
+} ThreadData;
+
+//An array of kernel matrices to be used for image convolution.
 //The indexes of these match the enumeration from the header file. ie. algorithms[BLUR] returns the kernel corresponding to a box blur.
 Matrix algorithms[]={
     {{0,-1,0},{-1,4,-1},{0,-1,0}},
@@ -51,20 +60,48 @@ uint8_t getPixelValue(Image* srcImage,int x,int y,int bit,Matrix algorithm){
     return result;
 }
 
-//convolute:  Applies a kernel matrix to an image
-//Parameters: srcImage: The image being convoluted
-//            destImage: A pointer to a  pre-allocated (including space for the pixel array) structure to receive the convoluted image.  It should be the same size as srcImage
-//            algorithm: The kernel matrix to use for the convolution
-//Returns: Nothing
-void convolute(Image* srcImage,Image* destImage,Matrix algorithm){
-    int row,pix,bit,span;
-    span=srcImage->bpp*srcImage->bpp;
-    for (row=0;row<srcImage->height;row++){
-        for (pix=0;pix<srcImage->width;pix++){
-            for (bit=0;bit<srcImage->bpp;bit++){
-                destImage->data[Index(pix,row,srcImage->width,bit,srcImage->bpp)]=getPixelValue(srcImage,pix,row,bit,algorithm);
+//originally convolute, has the same functionailty but consumes the thread data to be used
+void* convoluteSection(void* arg) {
+    ThreadData* data = (ThreadData*)arg;
+
+    int row, pix, bit;
+    for (row = data->start; row < data->end; row++) {
+        for (pix = 0; pix < data->srcImage->width; pix++) {
+            for (bit = 0; bit < data->srcImage->bpp; bit++) {
+                data->destImage->data[Index(pix, row, data->srcImage->width, bit, data->srcImage->bpp)] =
+                    getPixelValue(data->srcImage, pix, row, bit, data->algorithm);
             }
         }
+    }
+
+    pthread_exit(NULL);
+}
+
+//convolute is now essentially a threading funtion that splits up the data, creates threads, and joins them after execution
+void convolute(Image* srcImage, Image* destImage, Matrix algorithm) {
+    int num_threads = 10;
+    pthread_t threads[num_threads];
+    ThreadData threadData[num_threads];
+
+    int rows_per_thread = srcImage->height / num_threads;
+    int remaining_rows = srcImage->height % num_threads;
+
+    int row_start = 0;
+    for (int i = 0; i < num_threads; i++) {
+        threadData[i].srcImage = srcImage;
+        threadData[i].destImage = destImage;
+        memcpy(threadData[i].algorithm, algorithm, sizeof(Matrix));
+
+        threadData[i].start = row_start;
+        threadData[i].end = row_start + rows_per_thread + (i < remaining_rows ? 1 : 0);
+
+        pthread_create(&threads[i], NULL, convoluteSection, (void *)&threadData[i]);
+
+        row_start = threadData[i].end;
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        pthread_join(threads[i], NULL);
     }
 }
 
@@ -93,7 +130,7 @@ int main(int argc,char** argv){
     long t1,t2;
     t1=time(NULL);
 
-    stbi_set_flip_vertically_on_load(0); 
+    stbi_set_flip_vertically_on_load(0);
     if (argc!=3) return Usage();
     char* fileName=argv[1];
     if (!strcmp(argv[1],"pic4.jpg")&&!strcmp(argv[2],"gauss")){
@@ -101,7 +138,7 @@ int main(int argc,char** argv){
     }
     enum KernelTypes type=GetKernelType(argv[2]);
 
-    Image srcImage,destImage,bwImage;   
+    Image srcImage,destImage,bwImage;
     srcImage.data=stbi_load(fileName,&srcImage.width,&srcImage.height,&srcImage.bpp,0);
     if (!srcImage.data){
         printf("Error loading file %s.\n",fileName);
@@ -114,7 +151,7 @@ int main(int argc,char** argv){
     convolute(&srcImage,&destImage,algorithms[type]);
     stbi_write_png("output.png",destImage.width,destImage.height,destImage.bpp,destImage.data,destImage.bpp*destImage.width);
     stbi_image_free(srcImage.data);
-    
+
     free(destImage.data);
     t2=time(NULL);
     printf("Took %ld seconds\n",t2-t1);
